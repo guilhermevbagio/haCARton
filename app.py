@@ -2,10 +2,9 @@ import streamlit as st
 import numpy as np
 import cv2
 import os
-from PIL import Image
-from dw_processor import process_image, temporal_vote, render_overlay, CLASS_NAMES, CLASS_COLORS
+from pathlib import Path
 
-st.set_page_config(page_title="haCARton - Satellite Review", layout="wide")
+st.set_page_config(page_title="haCARton - Revisão de Imagens Satelitais", layout="wide")
 
 st.markdown("""
 <style>
@@ -15,280 +14,209 @@ st.markdown("""
         font-weight: bold;
         padding: 0.5rem 1rem;
     }
-    div[data-testid="stHorizontalBlock"] > div:nth-child(2) > div > button {
+    div[data-testid="stHorizontalBlock"] > div:nth-child(1) > div > button {
         background-color: #28a745 !important;
         color: white !important;
     }
-    div[data-testid="stHorizontalBlock"] > div:nth-child(3) > div > button {
+    div[data-testid="stHorizontalBlock"] > div:nth-child(2) > div > button {
         background-color: #dc3545 !important;
         color: white !important;
     }
-    div[data-testid="stHorizontalBlock"] > div:nth-child(4) > div > button {
+    div[data-testid="stHorizontalBlock"] > div:nth-child(3) > div > button {
         background-color: #ffc107 !important;
         color: black !important;
     }
-    .stImage img {
-        max-height: 70vh;
+    div[data-testid="stImage"] img {
+        max-height: 40vh;
         object-fit: contain;
     }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("haCARton - Satellite Image Review")
-st.markdown("Classify satellite imagery using local AI models.")
+CLASS_NAMES = [
+    "Água", "Floresta", "Grama", "Vegetação Alagada", "Lavoura",
+    "Vegetação Rasteira", "Área Urbana", "Solo Exposto", "Neve"
+]
+CLASS_COLORS = [
+    [47, 135, 224], [56, 168, 73], [191, 216, 106], [154, 194, 177],
+    [229, 198, 129], [188, 177, 147], [196, 82, 102], [178, 164, 145], [242, 243, 244]
+]
 
-if "result" not in st.session_state:
-    st.session_state.result = None
+IMAGES_DIR = Path(__file__).parent / "data" / "images"
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+
+
+def load_images_from_folder():
+    if not IMAGES_DIR.exists():
+        return []
+    files = sorted([
+        f for f in IMAGES_DIR.iterdir()
+        if f.suffix.lower() in IMAGE_EXTENSIONS
+    ])
+    images = []
+    for f in files:
+        img = cv2.imread(str(f))
+        if img is not None:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            images.append(img)
+    return images
+
+
+def generate_mock_image(seed):
+    rng = np.random.RandomState(seed)
+    h, w = 256, 256
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+
+    for _ in range(6):
+        cx, cy = rng.randint(30, w - 30), rng.randint(30, h - 30)
+        rw, rh = rng.randint(20, 80), rng.randint(20, 80)
+        color = (
+            int(rng.randint(30, 120)),
+            int(rng.randint(80, 180)),
+            int(rng.randint(20, 100)),
+        )
+        cv2.rectangle(img, (cx - rw, cy - rh), (cx + rw, cy + rh), color, -1)
+        pts = rng.randint(0, min(h, w), (rng.randint(4, 8), 2)).astype(np.int32)
+        cv2.fillPoly(img, [pts], color)
+
+    for _ in range(8):
+        cx, cy = rng.randint(0, w), rng.randint(0, h)
+        radius = rng.randint(10, 40)
+        color = (
+            int(rng.randint(20, 100)),
+            int(rng.randint(60, 150)),
+            int(rng.randint(10, 80)),
+        )
+        cv2.circle(img, (cx, cy), radius, color, -1)
+
+    noise = rng.normal(0, 12, img.shape).astype(np.int16)
+    img = np.clip(img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+    img = cv2.GaussianBlur(img, (5, 5), 1.0)
+    return img
+
+
+def create_work_units():
+    classifications = [
+        ("Floresta", 0.94),
+        ("Lavoura", 0.87),
+        ("Vegetação Rasteira", 0.72),
+        ("Solo Exposto", 0.58),
+        ("Área Urbana", 0.45),
+    ]
+    real_images = load_images_from_folder()
+    units = []
+    for i, (cls, conf) in enumerate(classifications):
+        if i < len(real_images):
+            image = real_images[i]
+        else:
+            image = generate_mock_image(seed=i * 42 + 7)
+        units.append({
+            "id": i + 1,
+            "area_ha": 65000,
+            "image": image,
+            "classification": cls,
+            "confidence": conf,
+            "status": "pendente",
+        })
+    return units
+
+
+def render_classification_overlay(image, class_idx):
+    overlay = image.copy()
+    color = CLASS_COLORS[class_idx % len(CLASS_COLORS)]
+    mask = np.all(overlay > [20, 60, 10], axis=2)
+    overlay[mask] = (np.array(overlay[mask]) * 0.5 + np.array(color) * 0.5).astype(np.uint8)
+    return overlay
+
+
+if "work_units" not in st.session_state:
+    st.session_state.work_units = create_work_units()
 if "current_idx" not in st.session_state:
     st.session_state.current_idx = 0
-if "image_np" not in st.session_state:
-    st.session_state.image_np = None
 
-col_source, col_model = st.columns(2)
-with col_source:
-    source = st.radio("Data source", ["Upload Image", "Earth Engine (Sentinel-2)"], horizontal=True)
-with col_model:
-    model_choice = st.radio("Model", ["Dynamic World", "Prithvi", "Ensemble"], horizontal=True)
+st.title("haCARton - Revisão de Classificação")
+st.markdown("Blocos de trabalho classificados por modelo de IA.")
 
-confidence_threshold = st.slider("Confidence threshold", 0.0, 1.0, 0.0, 0.05,
-                                 help="Filter out pixels below this confidence. 0 = show all.")
+units = st.session_state.work_units
+statuses = [u["status"] for u in units]
+n_aceito = statuses.count("aceito")
+n_rejeitado = statuses.count("rejeitado")
+n_edicao = statuses.count("requer_edicao")
+n_pendente = statuses.count("pendente")
 
-if source == "Upload Image":
-    uploaded_file = st.file_uploader("Upload satellite image", type=["png", "jpg", "jpeg", "tif"])
-    if uploaded_file is not None:
-        image = Image.open(uploaded_file)
-        st.session_state.image_np = np.array(image)
-        st.image(image, width="stretch")
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Aceito", n_aceito)
+col2.metric("Rejeitado", n_rejeitado)
+col3.metric("Requer Edição", n_edicao)
+col4.metric("Pendente", n_pendente)
 
-        if st.button("Process Image"):
-            with st.spinner("Running Dynamic World classification..."):
-                st.session_state.result = process_image(st.session_state.image_np)
-                st.session_state.current_idx = 0
+st.progress((n_aceito + n_rejeitado + n_edicao) / len(units))
+
+idx = st.session_state.current_idx
+unit = units[idx]
+
+class_idx = CLASS_NAMES.index(unit["classification"]) if unit["classification"] in CLASS_NAMES else 0
+overlay_img = render_classification_overlay(unit["image"], class_idx)
+
+status_label = {
+    "pendente": "⏳ Pendente",
+    "aceito": "✅ Aceito",
+    "rejeitado": "❌ Rejeitado",
+    "requer_edicao": "✏️ Requer Edição",
+}[unit["status"]]
+
+st.markdown(f"**Bloco #{unit['id']}** — Confiança: {unit['confidence']:.0%} — {status_label}")
+
+col_img, col_class = st.columns(2)
+with col_img:
+    st.image(unit["image"], caption="Imagem Satelital", use_container_width=True)
+with col_class:
+    st.image(overlay_img, caption="Classificação", use_container_width=True)
+
+st.progress((idx + 1) / len(units))
+
+nav1, nav2, nav3, nav4, nav5 = st.columns([1, 1, 2, 1, 1])
+
+with nav1:
+    if idx > 0:
+        if st.button("← Anterior"):
+            st.session_state.current_idx -= 1
             st.rerun()
 
+if unit["status"] == "pendente":
+    with nav3:
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            if st.button("✓ Aceito"):
+                st.session_state.work_units[idx]["status"] = "aceito"
+                if idx < len(units) - 1:
+                    st.session_state.current_idx += 1
+                st.rerun()
+        with b2:
+            if st.button("✗ Rejeitado"):
+                st.session_state.work_units[idx]["status"] = "rejeitado"
+                if idx < len(units) - 1:
+                    st.session_state.current_idx += 1
+                st.rerun()
+        with b3:
+            if st.button("✎ Requer Edição"):
+                st.session_state.work_units[idx]["status"] = "requer_edicao"
+                if idx < len(units) - 1:
+                    st.session_state.current_idx += 1
+                st.rerun()
 else:
-    st.subheader("Earth Engine Location")
-    col1, col2 = st.columns(2)
-    with col1:
-        lon = st.number_input("Longitude", value=-54.9732, format="%.4f")
-    with col2:
-        lat = st.number_input("Latitude", value=-19.9862, format="%.4f")
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        radius = st.slider("Radius (m)", 500, 5000, 2000, step=500)
-    with col2:
-        date_start = st.date_input("Start date", value=None)
-    with col3:
-        date_end = st.date_input("End date", value=None)
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        use_temporal = st.checkbox("Use temporal compositing", value=False)
-    with col2:
-        num_images = st.slider("Temporal images", 3, 15, 5, disabled=not use_temporal)
-    with col3:
-        temporal_method = st.selectbox("Composite method", ["median", "mean"], disabled=not use_temporal)
-
-    col1, col2 = st.columns(2)
-    with col1:
-        fetch_ee = st.button("Fetch from Earth Engine")
-    with col2:
-        fetch_demo = st.button("Fetch Demo (cached)")
-
-    if fetch_demo:
-        demo_path = os.path.join(os.path.dirname(__file__), "demo_s2.npy")
-        if os.path.exists(demo_path):
-            s2_array = np.load(demo_path)
-            display = s2_array[:, :, [2, 1, 0]]
-            display = (display - display.min()) / (display.max() - display.min()) * 255
-            st.session_state.image_np = display.astype(np.uint8)
-            st.session_state.s2_array = s2_array
-            st.image(st.session_state.image_np, width="stretch")
-            st.success(f"Loaded demo image: {s2_array.shape}")
+    with nav3:
+        if st.button("🔄 Resetar"):
+            st.session_state.work_units[idx]["status"] = "pendente"
             st.rerun()
-        else:
-            st.error("Demo image not found. Run 'Fetch from Earth Engine' first to generate it.")
 
-    if fetch_ee:
-        try:
-            import ee
-            from ee_fetcher import initialize, fetch_sentinel2, fetch_temporal_stack, temporal_composite
-
-            if not initialize():
-                st.info("Opening Earth Engine authentication...")
-                from ee_fetcher import authenticate
-                authenticate()
-
-            start_str = date_start.strftime('%Y-%m-%d') if date_start else '2024-01-01'
-            end_str = date_end.strftime('%Y-%m-%d') if date_end else '2024-12-31'
-
-            if use_temporal:
-                with st.spinner(f"Fetching {num_images} temporal images for [{lon}, {lat}]..."):
-                    arrays = fetch_temporal_stack(lon, lat, radius, start_str, end_str, max_images=num_images)
-                    s2_array = temporal_composite(arrays, method=temporal_method)
-            else:
-                with st.spinner(f"Fetching Sentinel-2 imagery for [{lon}, {lat}]..."):
-                    s2_array = fetch_sentinel2(lon, lat, radius, start_str, end_str)
-
-            display = s2_array[:, :, [2, 1, 0]]
-            display = (display - display.min()) / (display.max() - display.min()) * 255
-            st.session_state.image_np = display.astype(np.uint8)
-            st.session_state.s2_array = s2_array
-
-            st.image(st.session_state.image_np, width="stretch")
-            st.success(f"Loaded Sentinel-2 image: {s2_array.shape}")
-
-        except Exception as e:
-            st.error(f"Error: {e}")
-
-    if st.session_state.image_np is not None and st.button("Classify Image"):
-        is_s2 = "s2_array" in st.session_state
-
-        try:
-            if model_choice == "Ensemble" and is_s2:
-                with st.spinner("Running Ensemble (Dynamic World + Prithvi)..."):
-                    from ensemble import ensemble_classify
-                    st.session_state.result = ensemble_classify(
-                        st.session_state.s2_array,
-                        confidence_threshold=confidence_threshold
-                    )
-                    st.session_state.current_idx = 0
-            elif model_choice == "Prithvi" and is_s2:
-                with st.spinner("Running Prithvi classification..."):
-                    from prithvi_processor import classify_with_prithvi
-                    from dw_processor import CLASS_COLORS as DW_COLORS
-                    prithvi_result = classify_with_prithvi(
-                        st.session_state.s2_array,
-                        confidence_threshold=confidence_threshold
-                    )
-                    color_overlay = DW_COLORS[prithvi_result["class_map"].clip(0)]
-                    st.session_state.result = {
-                        "class_map": prithvi_result["class_map"],
-                        "confidence_map": prithvi_result["confidence_map"],
-                        "color_overlay": color_overlay,
-                        "regions": []
-                    }
-                    from dw_processor import extract_regions
-                    st.session_state.result["regions"] = extract_regions(
-                        prithvi_result["class_map"],
-                        prithvi_result["confidence_map"]
-                    )
-                    st.session_state.current_idx = 0
-            else:
-                with st.spinner("Running Dynamic World classification..."):
-                    st.session_state.result = process_image(
-                        st.session_state.s2_array if is_s2 else st.session_state.image_np,
-                        is_sentinel2=is_s2,
-                        confidence_threshold=confidence_threshold
-                    )
-                    st.session_state.current_idx = 0
+with nav5:
+    if idx < len(units) - 1:
+        if st.button("Próximo →"):
+            st.session_state.current_idx += 1
             st.rerun()
-        except Exception as e:
-            st.error(f"Classification failed: {e}")
 
-if st.session_state.result and st.session_state.image_np is not None:
-    result = st.session_state.result
-    regions = result.get("regions", [])
-    idx = st.session_state.current_idx
-
-    st.divider()
-
-    overlay_img = render_overlay(st.session_state.image_np, result)
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Original")
-        st.image(st.session_state.image_np, width="stretch")
-    with col2:
-        st.subheader("Classified")
-        st.image(overlay_img, width="stretch")
-
-    if regions:
-        st.subheader("Classification Legend")
-        legend_cols = st.columns(len(CLASS_NAMES))
-        for i, (col, name) in enumerate(zip(legend_cols, CLASS_NAMES)):
-            color_hex = "#{:02x}{:02x}{:02x}".format(*CLASS_COLORS[i])
-            count = sum(1 for r in regions if r["class_idx"] == i)
-            col.markdown(f'<div style="display:flex;align-items:center;gap:6px;">'
-                        f'<div style="width:16px;height:16px;background:{color_hex};border:1px solid #333;"></div>'
-                        f'<span style="font-size:12px;">{name} ({count})</span></div>',
-                        unsafe_allow_html=True)
-
-        if idx < len(regions):
-            highlight = regions[idx]["id"]
-
-            region = regions[idx]
-            st.subheader(f"Region {idx + 1} of {len(regions)}")
-
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.write(f"**Class:** {region['class']}")
-            with col2:
-                st.write(f"**Confidence:** {region['confidence']:.0%}")
-            with col3:
-                st.write(f"**Area:** {region['area']} px²")
-
-            status_colors = {
-                "approved": "green",
-                "rejected": "red",
-                "needs_adjustment": "orange",
-                "pending": "gray"
-            }
-            st.write(f"**Status:** :{status_colors[region['status']]}[{region['status']}]")
-
-            st.progress((idx + 1) / len(regions))
-
-            col1, spacer1, col2, col3, col4, spacer2, col5 = st.columns([2, 1, 3, 3, 3, 1, 2])
-
-            with col1:
-                if idx > 0:
-                    if st.button("← Prev"):
-                        st.session_state.current_idx -= 1
-                        st.rerun()
-
-            with spacer1:
-                pass
-
-            with col2:
-                if st.button("✓ Approve", key=f"approve_{idx}"):
-                    st.session_state.result["regions"][idx]["status"] = "approved"
-                    if idx < len(regions) - 1:
-                        st.session_state.current_idx += 1
-                    st.rerun()
-
-            with col3:
-                if st.button("✗ Reject", key=f"reject_{idx}"):
-                    st.session_state.result["regions"][idx]["status"] = "rejected"
-                    if idx < len(regions) - 1:
-                        st.session_state.current_idx += 1
-                    st.rerun()
-
-            with col4:
-                if st.button("⚠ Adjust", key=f"adjust_{idx}"):
-                    st.session_state.result["regions"][idx]["status"] = "needs_adjustment"
-                    if idx < len(regions) - 1:
-                        st.session_state.current_idx += 1
-                    st.rerun()
-
-            with spacer2:
-                pass
-
-            with col5:
-                if idx < len(regions) - 1:
-                    if st.button("Next →"):
-                        st.session_state.current_idx += 1
-                        st.rerun()
-    else:
-        st.info("No regions found. Try adjusting the confidence threshold.")
-
-    st.divider()
-    st.subheader("Summary")
-    approved = sum(1 for r in regions if r["status"] == "approved")
-    rejected = sum(1 for r in regions if r["status"] == "rejected")
-    pending = sum(1 for r in regions if r["status"] == "pending")
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Approved", approved)
-    col2.metric("Rejected", rejected)
-    col3.metric("Pending", pending)
+if st.button("🔄 Reiniciar Tudo", use_container_width=True):
+    st.session_state.work_units = create_work_units()
+    st.session_state.current_idx = 0
+    st.rerun()
