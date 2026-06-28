@@ -4,17 +4,17 @@ from streamlit_app_utils import (
     SEGMENTER_OPTIONS,
     apply_global_styles,
     ensure_session_defaults,
-    render_manual_upload_mode,
+    render_deepglobe_mode,
 )
 
-st.set_page_config(page_title="haCARton - Revis?o Manual", layout="wide")
+st.set_page_config(page_title="haCARton - Coleta DeepGlobe", layout="wide")
 apply_global_styles()
 ensure_session_defaults()
 
-st.title("haCARton - GeoCAR Auto-Sync")
+st.title("haCARton - Coleta DeepGlobe")
 st.markdown(
-    "Receba uma imagem de sat?lite, gere regi?es automaticamente e fa?a a "
-    "pr?-classifica??o para revis?o humana no contexto do CAR."
+    "Revise imagens em lote a partir de uma pasta local do DeepGlobe e gere "
+    "novos exemplos rotulados para o validador autom?tico."
 )
 
 segmenter_label = st.selectbox(
@@ -27,4 +27,4 @@ segmenter_label = st.selectbox(
 )
 segmenter_key = SEGMENTER_OPTIONS[segmenter_label]
 
-render_manual_upload_mode(segmenter_key)
+render_deepglobe_mode(segmenter_key)
