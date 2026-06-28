@@ -1,6 +1,7 @@
 import streamlit as st
 import numpy as np
 import cv2
+import os
 from PIL import Image
 from dw_processor import process_image, temporal_vote, render_overlay, CLASS_NAMES, CLASS_COLORS
 
@@ -89,7 +90,27 @@ else:
     with col3:
         temporal_method = st.selectbox("Composite method", ["median", "mean"], disabled=not use_temporal)
 
-    if st.button("Fetch from Earth Engine"):
+    col1, col2 = st.columns(2)
+    with col1:
+        fetch_ee = st.button("Fetch from Earth Engine")
+    with col2:
+        fetch_demo = st.button("Fetch Demo (cached)")
+
+    if fetch_demo:
+        demo_path = os.path.join(os.path.dirname(__file__), "demo_s2.npy")
+        if os.path.exists(demo_path):
+            s2_array = np.load(demo_path)
+            display = s2_array[:, :, [2, 1, 0]]
+            display = (display - display.min()) / (display.max() - display.min()) * 255
+            st.session_state.image_np = display.astype(np.uint8)
+            st.session_state.s2_array = s2_array
+            st.image(st.session_state.image_np, width="stretch")
+            st.success(f"Loaded demo image: {s2_array.shape}")
+            st.rerun()
+        else:
+            st.error("Demo image not found. Run 'Fetch from Earth Engine' first to generate it.")
+
+    if fetch_ee:
         try:
             import ee
             from ee_fetcher import initialize, fetch_sentinel2, fetch_temporal_stack, temporal_composite
