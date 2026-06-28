@@ -43,8 +43,21 @@ def get_model():
     return _model
 
 
-def normalize_image(image: np.ndarray) -> np.ndarray:
-    h, w = image.shape[:2]
+def normalize_sentinel2(bands: np.ndarray) -> np.ndarray:
+    """Normalize proper 9-band Sentinel-2 data (0-10000 range)."""
+    image = bands.astype(np.float32)
+    
+    # Apply the Dynamic World normalization from the notebook
+    image_log = np.log(image * 0.005 + 1)
+    image_norm = (image_log - NORM_PERCENTILES[:, 0]) / NORM_PERCENTILES[:, 1]
+    image_sigmoid = np.exp(image_norm * 5 - 1)
+    image_sigmoid = image_sigmoid / (image_sigmoid + 1)
+    
+    return image_sigmoid.astype(np.float32)
+
+
+def normalize_rgb(image: np.ndarray) -> np.ndarray:
+    """Normalize RGB image by approximating 9 Sentinel-2 bands."""
     if image.ndim == 2:
         image = np.stack([image] * 3, axis=-1)
     if image.shape[2] == 4:
@@ -66,15 +79,20 @@ def normalize_image(image: np.ndarray) -> np.ndarray:
     image_norm = (image_log - NORM_PERCENTILES[:, 0]) / NORM_PERCENTILES[:, 1]
     image_sigmoid = np.exp(image_norm * 5 - 1)
     image_sigmoid = image_sigmoid / (image_sigmoid + 1)
+    
     return image_sigmoid.astype(np.float32)
 
 
-def classify_image(image: np.ndarray) -> dict:
+def classify_image(image: np.ndarray, is_sentinel2: bool = False) -> dict:
     """Run Dynamic World classification and return results."""
     model = get_model()
     h, w = image.shape[:2]
 
-    normalized = normalize_image(image)
+    if is_sentinel2 and image.shape[2] == 9:
+        normalized = normalize_sentinel2(image)
+    else:
+        normalized = normalize_rgb(image)
+
     input_tensor = tf.constant(normalized[np.newaxis, ...])
 
     with tf.device('/CPU:0'):
@@ -84,10 +102,8 @@ def classify_image(image: np.ndarray) -> dict:
     class_map = np.argmax(probs, axis=-1)
     confidence_map = np.max(probs, axis=-1)
 
-    # Create color overlay
     color_overlay = CLASS_COLORS[class_map]
 
-    # Find connected regions for each class
     regions = []
     region_id = 0
     for cls_idx in range(len(CLASS_NAMES)):
@@ -138,6 +154,11 @@ def classify_image(image: np.ndarray) -> dict:
 
 def render_overlay(image: np.ndarray, result: dict, highlight_region: int = None) -> np.ndarray:
     """Render classification overlay on image."""
+    if image.ndim == 3 and image.shape[2] == 9:
+        image = image[:, :, [2, 1, 0]]
+        image = (image - image.min()) / (image.max() - image.min()) * 255
+        image = image.astype(np.uint8)
+    
     if image.shape[2] == 4:
         image = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
 
@@ -155,6 +176,6 @@ def render_overlay(image: np.ndarray, result: dict, highlight_region: int = None
     return blended
 
 
-def process_image(image: np.ndarray) -> dict:
+def process_image(image: np.ndarray, is_sentinel2: bool = False) -> dict:
     """Full pipeline: classify and find regions."""
-    return classify_image(image)
+    return classify_image(image, is_sentinel2)
