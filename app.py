@@ -3,7 +3,9 @@ import numpy as np
 import cv2
 import os
 from PIL import Image
-from dw_processor import process_image, temporal_vote, render_overlay, CLASS_NAMES, CLASS_COLORS
+from dw_processor import process_image as dw_process_image, temporal_vote, render_overlay, CLASS_NAMES, CLASS_COLORS
+from mock_processor import process_image as sam2_process_image
+from streamlit_app_utils import DEEPGLOBE_MAX_DIM, SEGMENTER_OPTIONS, ensure_session_defaults, obter_validacao_manual, preparar_imagem_para_revisao, processar_imagem_com_segmentador, render_manual_label_buttons, render_validator_result, validador_disponivel
 
 st.set_page_config(page_title="haCARton - Satellite Review", layout="wide")
 
@@ -37,6 +39,8 @@ st.markdown("""
 st.title("haCARton - Satellite Image Review")
 st.markdown("Classify satellite imagery using local AI models.")
 
+ensure_session_defaults()
+
 if "result" not in st.session_state:
     st.session_state.result = None
 if "current_idx" not in st.session_state:
@@ -44,11 +48,19 @@ if "current_idx" not in st.session_state:
 if "image_np" not in st.session_state:
     st.session_state.image_np = None
 
+SEGMENTER_LABEL_BY_KEY = {key: label for label, key in SEGMENTER_OPTIONS.items()}
+SAM2_LABEL = SEGMENTER_LABEL_BY_KEY.get("sam2", "SAM2")
+SAMGEO_LABEL = SEGMENTER_LABEL_BY_KEY.get("samgeo", "SAMGeo experimental")
+RSAM_LABEL = SEGMENTER_LABEL_BY_KEY.get("rsam_seg", "RSAM-Seg experimental")
+MODEL_OPTIONS = ["Dynamic World", "Prithvi", "Ensemble"] + [
+    label for label in [SAM2_LABEL, SAMGEO_LABEL, RSAM_LABEL] if label in SEGMENTER_OPTIONS
+]
+
 col_source, col_model = st.columns(2)
 with col_source:
     source = st.radio("Data source", ["Upload Image", "Earth Engine (Sentinel-2)"], horizontal=True)
 with col_model:
-    model_choice = st.radio("Model", ["Dynamic World", "Prithvi", "Ensemble"], horizontal=True)
+    model_choice = st.radio("Modelo", MODEL_OPTIONS, horizontal=True)
 
 confidence_threshold = st.slider("Confidence threshold", 0.0, 1.0, 0.0, 0.05,
                                  help="Filter out pixels below this confidence. 0 = show all.")
@@ -57,14 +69,40 @@ if source == "Upload Image":
     uploaded_file = st.file_uploader("Upload satellite image", type=["png", "jpg", "jpeg", "tif"])
     if uploaded_file is not None:
         image = Image.open(uploaded_file)
-        st.session_state.image_np = np.array(image)
+        original_np = np.array(image)
+        st.session_state.image_np = original_np
+        st.session_state.imagem_original = original_np
+        st.session_state.uploaded_filename = uploaded_file.name
         st.image(image, width="stretch")
 
+        if model_choice == SAM2_LABEL:
+            preview_np = preparar_imagem_para_revisao(original_np)
+            if preview_np.shape[:2] != original_np.shape[:2]:
+                st.info(
+                    f"Para evitar travamentos no protótipo, a imagem será redimensionada para no máximo {DEEPGLOBE_MAX_DIM}px antes da segmentação."
+                )
+
         if st.button("Process Image"):
-            with st.spinner("Running Dynamic World classification..."):
-                st.session_state.result = process_image(st.session_state.image_np)
+            try:
+                if model_choice in {SAM2_LABEL, SAMGEO_LABEL, RSAM_LABEL}:
+                    image_for_processing = preparar_imagem_para_revisao(st.session_state.image_np)
+                    segmenter_key = SEGMENTER_OPTIONS[model_choice]
+                    with st.spinner(f"Running {model_choice}..."):
+                        st.session_state.result = processar_imagem_com_segmentador(image_for_processing, segmenter_key)
+                        st.session_state.image_np = image_for_processing
+                        st.session_state.imagem_original = image_for_processing
+                        st.session_state.imagem_segmentada = st.session_state.result["segmentation_overlay"]
+                        st.session_state.validator_manual_key = None
+                        st.session_state.validator_manual_result = None
+                        st.session_state.validator_manual_error = None
+                else:
+                    with st.spinner("Running Dynamic World classification..."):
+                        st.session_state.result = dw_process_image(st.session_state.image_np)
                 st.session_state.current_idx = 0
-            st.rerun()
+            except Exception as e:
+                st.error(f"Processing failed: {e}")
+            else:
+                st.rerun()
 
 else:
     st.subheader("Earth Engine Location")
@@ -175,9 +213,15 @@ else:
                         prithvi_result["confidence_map"]
                     )
                     st.session_state.current_idx = 0
+            elif model_choice in {SAM2_LABEL, SAMGEO_LABEL, RSAM_LABEL}:
+                if is_s2:
+                    raise ValueError(f"{model_choice} está disponível apenas para upload de imagem no momento.")
+                with st.spinner(f"Running {model_choice}..."):
+                    st.session_state.result = processar_imagem_com_segmentador(st.session_state.image_np, SEGMENTER_OPTIONS[model_choice])
+                    st.session_state.current_idx = 0
             else:
                 with st.spinner("Running Dynamic World classification..."):
-                    st.session_state.result = process_image(
+                    st.session_state.result = dw_process_image(
                         st.session_state.s2_array if is_s2 else st.session_state.image_np,
                         is_sentinel2=is_s2,
                         confidence_threshold=confidence_threshold
@@ -194,101 +238,138 @@ if st.session_state.result and st.session_state.image_np is not None:
 
     st.divider()
 
-    overlay_img = render_overlay(st.session_state.image_np, result)
+    if "segmentation_overlay" in result:
+        st.subheader(result.get("segmenter_used", model_choice if "model_choice" in locals() else SAM2_LABEL))
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.image(st.session_state.image_np, caption="Original", use_container_width=True)
+        with col2:
+            st.image(result["segmentation_overlay"], caption="Segmentação", use_container_width=True)
+        with col3:
+            st.image(result["classification_overlay"], caption="Pré-classificação", use_container_width=True)
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Original")
-        st.image(st.session_state.image_np, width="stretch")
-    with col2:
-        st.subheader("Classified")
-        st.image(overlay_img, width="stretch")
+        if result.get("backend_note"):
+            st.info(result["backend_note"]["message"])
 
-    if regions:
-        st.subheader("Classification Legend")
-        legend_cols = st.columns(len(CLASS_NAMES))
-        for i, (col, name) in enumerate(zip(legend_cols, CLASS_NAMES)):
-            color_hex = "#{:02x}{:02x}{:02x}".format(*CLASS_COLORS[i])
-            count = sum(1 for r in regions if r["class_idx"] == i)
-            col.markdown(f'<div style="display:flex;align-items:center;gap:6px;">'
-                        f'<div style="width:16px;height:16px;background:{color_hex};border:1px solid #333;"></div>'
-                        f'<span style="font-size:12px;">{name} ({count})</span></div>',
-                        unsafe_allow_html=True)
+        if result.get("rsam_note"):
+            st.warning(result["rsam_note"]["message"])
 
-        if idx < len(regions):
-            highlight = regions[idx]["id"]
+        st.caption(result.get("prototype_message", "Protótipo heurístico baseado em máscaras."))
 
-            region = regions[idx]
-            st.subheader(f"Region {idx + 1} of {len(regions)}")
+        st.session_state.imagem_original = st.session_state.image_np
+        st.session_state.imagem_segmentada = result["segmentation_overlay"]
+        upload_key = f"{st.session_state.get('uploaded_filename', 'manual')}:sam2"
+        validator_result, validator_error = obter_validacao_manual(
+            upload_key,
+            st.session_state.image_np,
+            result["segmentation_overlay"],
+        )
+        if validator_result is not None:
+            render_validator_result(validator_result)
+        elif validator_error and validador_disponivel():
+            st.warning(f"Não foi possível executar o validador automático: {validator_error}")
+        else:
+            st.info("Treine o validador para receber uma recomendação automática da qualidade da segmentação.")
 
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.write(f"**Class:** {region['class']}")
-            with col2:
-                st.write(f"**Confidence:** {region['confidence']:.0%}")
-            with col3:
-                st.write(f"**Area:** {region['area']} px²")
+        render_manual_label_buttons()
 
-            status_colors = {
-                "approved": "green",
-                "rejected": "red",
-                "needs_adjustment": "orange",
-                "pending": "gray"
-            }
-            st.write(f"**Status:** :{status_colors[region['status']]}[{region['status']}]")
+        st.subheader("Resumo por classe")
+        st.dataframe(result.get("summary", []), use_container_width=True, hide_index=True)
 
-            st.progress((idx + 1) / len(regions))
+    else:
+        overlay_img = render_overlay(st.session_state.image_np, result)
 
-            col1, spacer1, col2, col3, col4, spacer2, col5 = st.columns([2, 1, 3, 3, 3, 1, 2])
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("Original")
+            st.image(st.session_state.image_np, use_container_width=True)
+        with col2:
+            st.subheader("Classified")
+            st.image(overlay_img, use_container_width=True)
 
-            with col1:
-                if idx > 0:
-                    if st.button("← Prev"):
+        if regions:
+            st.subheader("Classification Legend")
+            legend_cols = st.columns(len(CLASS_NAMES))
+            for i, (col, name) in enumerate(zip(legend_cols, CLASS_NAMES)):
+                color_hex = "#{:02x}{:02x}{:02x}".format(*CLASS_COLORS[i])
+                count = sum(1 for r in regions if r["class_idx"] == i)
+                col.markdown(
+                    f'<div style="display:flex;align-items:center;gap:6px;">'
+                    f'<div style="width:16px;height:16px;background:{color_hex};border:1px solid #333;"></div>'
+                    f'<span style="font-size:12px;">{name} ({count})</span></div>',
+                    unsafe_allow_html=True,
+                )
+
+            if idx < len(regions):
+                region = regions[idx]
+                st.subheader(f"Region {idx + 1} of {len(regions)}")
+
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.write(f"**Class:** {region['class']}")
+                with col2:
+                    st.write(f"**Confidence:** {region['confidence']:.0%}")
+                with col3:
+                    st.write(f"**Area:** {region['area']} px2")
+
+                status_colors = {
+                    "approved": "green",
+                    "rejected": "red",
+                    "needs_adjustment": "orange",
+                    "pending": "gray",
+                }
+                st.write(f"**Status:** :{status_colors[region['status']]}[{region['status']}]")
+
+                st.progress((idx + 1) / len(regions))
+
+                col1, spacer1, col2, col3, col4, spacer2, col5 = st.columns([2, 1, 3, 3, 3, 1, 2])
+
+                with col1:
+                    if idx > 0 and st.button("Prev", key=f"prev_{idx}"):
                         st.session_state.current_idx -= 1
                         st.rerun()
 
-            with spacer1:
-                pass
+                with spacer1:
+                    pass
 
-            with col2:
-                if st.button("✓ Approve", key=f"approve_{idx}"):
-                    st.session_state.result["regions"][idx]["status"] = "approved"
-                    if idx < len(regions) - 1:
-                        st.session_state.current_idx += 1
-                    st.rerun()
+                with col2:
+                    if st.button("Approve", key=f"approve_{idx}"):
+                        st.session_state.result["regions"][idx]["status"] = "approved"
+                        if idx < len(regions) - 1:
+                            st.session_state.current_idx += 1
+                        st.rerun()
 
-            with col3:
-                if st.button("✗ Reject", key=f"reject_{idx}"):
-                    st.session_state.result["regions"][idx]["status"] = "rejected"
-                    if idx < len(regions) - 1:
-                        st.session_state.current_idx += 1
-                    st.rerun()
+                with col3:
+                    if st.button("Reject", key=f"reject_{idx}"):
+                        st.session_state.result["regions"][idx]["status"] = "rejected"
+                        if idx < len(regions) - 1:
+                            st.session_state.current_idx += 1
+                        st.rerun()
 
-            with col4:
-                if st.button("⚠ Adjust", key=f"adjust_{idx}"):
-                    st.session_state.result["regions"][idx]["status"] = "needs_adjustment"
-                    if idx < len(regions) - 1:
-                        st.session_state.current_idx += 1
-                    st.rerun()
+                with col4:
+                    if st.button("Adjust", key=f"adjust_{idx}"):
+                        st.session_state.result["regions"][idx]["status"] = "needs_adjustment"
+                        if idx < len(regions) - 1:
+                            st.session_state.current_idx += 1
+                        st.rerun()
 
-            with spacer2:
-                pass
+                with spacer2:
+                    pass
 
-            with col5:
-                if idx < len(regions) - 1:
-                    if st.button("Next →"):
+                with col5:
+                    if idx < len(regions) - 1 and st.button("Next", key=f"next_{idx}"):
                         st.session_state.current_idx += 1
                         st.rerun()
-    else:
-        st.info("No regions found. Try adjusting the confidence threshold.")
+        else:
+            st.info("No regions found. Try adjusting the confidence threshold.")
 
-    st.divider()
-    st.subheader("Summary")
-    approved = sum(1 for r in regions if r["status"] == "approved")
-    rejected = sum(1 for r in regions if r["status"] == "rejected")
-    pending = sum(1 for r in regions if r["status"] == "pending")
+        st.divider()
+        st.subheader("Summary")
+        approved = sum(1 for r in regions if r["status"] == "approved")
+        rejected = sum(1 for r in regions if r["status"] == "rejected")
+        pending = sum(1 for r in regions if r["status"] == "pending")
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Approved", approved)
-    col2.metric("Rejected", rejected)
-    col3.metric("Pending", pending)
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Approved", approved)
+        col2.metric("Rejected", rejected)
+        col3.metric("Pending", pending)

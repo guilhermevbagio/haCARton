@@ -7,16 +7,18 @@ import numpy as np
 import streamlit as st
 from PIL import Image
 
-from mock_processor import CLASS_COLORS, process_image
+from mock_processor import CLASS_COLORS
+from segmentation_backends import get_segmenter_availability, run_segmentation_backend
 
 PROTOTYPE_DISCLAIMER = (
-    "Prot?tipo demonstrativo: a separa??o oficial entre ?rea consolidada e "
-    "?rea antropizada ap?s 22/07/2008 depende de cruzamento temporal com bases "
-    "como MapBiomas/SNIF e n?o pode ser conclu?da apenas pela imagem atual."
+    "Protótipo demonstrativo: a separação oficial entre área consolidada e "
+    "área antropizada após 22/07/2008 depende de cruzamento temporal com bases "
+    "como MapBiomas/SNIF e não pode ser concluída apenas pela imagem atual."
 )
 
 SEGMENTER_OPTIONS = {
-    "SAM2 padr?o (prot?tipo heur?stico)": "sam2",
+    "SAM2 padrão (protótipo heurístico)": "sam2",
+    "SAMGeo experimental": "samgeo",
     "RSAM-Seg experimental": "rsam_seg",
 }
 
@@ -87,7 +89,7 @@ def converter_para_pil(img):
             return Image.fromarray(img, mode="RGBA").convert("RGB")
         return Image.fromarray(img).convert("RGB")
 
-    raise TypeError(f"Tipo de imagem n?o suportado: {type(img)}")
+    raise TypeError(f"Tipo de imagem não suportado: {type(img)}")
 
 
 def montar_imagem_lado_a_lado(imagem_original, imagem_segmentada):
@@ -140,7 +142,7 @@ def encontrar_imagens_dataset(dataset_path, max_images=100):
 def carregar_dataset_local(dataset_path, max_images=100):
     dataset_path = Path(dataset_path).expanduser()
     if not dataset_path.exists() or not dataset_path.is_dir():
-        raise FileNotFoundError(f"Pasta do dataset n?o encontrada: {dataset_path}")
+        raise FileNotFoundError(f"Pasta do dataset não encontrada: {dataset_path}")
 
     imagens = encontrar_imagens_dataset(dataset_path, max_images=max_images)
     return str(dataset_path), imagens
@@ -197,7 +199,7 @@ def ensure_session_defaults():
 
 
 def processar_imagem_com_segmentador(image_np, segmenter_key):
-    return process_image(image_np, segmenter=segmenter_key)
+    return run_segmentation_backend(image_np, segmenter_key)
 
 
 def validador_disponivel():
@@ -213,7 +215,7 @@ def prever_validacao_automatica(imagem_original, imagem_segmentada):
 
 def obter_validacao_manual(upload_key, imagem_original, imagem_segmentada):
     if not validador_disponivel():
-        return None, "Modelo de valida??o autom?tica ainda n?o foi treinado/carregado."
+        return None, "Modelo de validação automática ainda não foi treinado/carregado."
 
     if st.session_state.validator_manual_key == upload_key:
         return st.session_state.validator_manual_result, st.session_state.validator_manual_error
@@ -233,7 +235,7 @@ def obter_validacao_manual(upload_key, imagem_original, imagem_segmentada):
 
 def obter_validacao_deepglobe(image_key, imagem_original, imagem_segmentada):
     if not validador_disponivel():
-        return None, "Modelo de valida??o autom?tica ainda n?o foi treinado/carregado."
+        return None, "Modelo de validação automática ainda não foi treinado/carregado."
 
     if st.session_state.validator_deepglobe_key == image_key:
         return st.session_state.validator_deepglobe_result, st.session_state.validator_deepglobe_error
@@ -251,25 +253,49 @@ def obter_validacao_deepglobe(image_key, imagem_original, imagem_segmentada):
         return None, str(exc)
 
 
-def render_validator_result(resultado, titulo="Valida??o autom?tica da segmenta??o"):
+def render_validator_result(resultado, titulo="Validação automática da segmentação"):
     st.subheader(titulo)
     classe = resultado["classe"]
     confianca = float(resultado["confianca"])
     probabilidades = resultado["probabilidades"]
+    classe_bruta = resultado.get("classe_bruta_modelo", classe)
+    margem = float(resultado.get("margem", 0.0))
+    decisao_calibrada = bool(resultado.get("decisao_calibrada", False))
+    motivo_calibracao = resultado.get("motivo_calibracao")
+    limiar_confianca = float(resultado.get("limiar_confianca", 0.60))
+    limiar_margem = float(resultado.get("limiar_margem", 0.12))
 
     if classe == "aprovar":
-        st.success(f"Recomenda??o do modelo: {classe} ({confianca:.0%})")
+        mensagem = f"Recomenda-se aprovar esta segmentação. Confiança estimada do modelo: {confianca:.0%}."
+        st.success(mensagem)
     elif classe == "rejeitar":
-        st.error(f"Recomenda??o do modelo: {classe} ({confianca:.0%})")
+        mensagem = f"Recomenda-se rejeitar esta segmentação. Confiança estimada do modelo: {confianca:.0%}."
+        st.error(mensagem)
     else:
-        st.warning(f"Recomenda??o do modelo: {classe} ({confianca:.0%})")
+        if decisao_calibrada:
+            mensagem = (
+                f"Recomenda-se revisar esta segmentação manualmente. "
+                f"O modelo inclinou para '{classe_bruta}', mas com confiança de {confianca:.0%} "
+                f"e margem de {margem:.0%}, abaixo dos limiares de segurança "
+                f"({limiar_confianca:.0%} e {limiar_margem:.0%})."
+            )
+            if motivo_calibracao == "baixa confianca":
+                mensagem += " Motivo principal: baixa confiança da predição."
+            elif motivo_calibracao == "classes muito proximas":
+                mensagem += " Motivo principal: classes muito próximas entre si."
+        else:
+            mensagem = f"Recomenda-se revisar esta segmentação manualmente. Confiança estimada do modelo: {confianca:.0%}."
+        st.warning(mensagem)
 
     prob_rows = [
-        {"Classe": nome, "Probabilidade": round(float(valor), 4)}
+        {
+            "Classe": nome,
+            "Probabilidade": round(float(valor), 4),
+            "Percentual": f"{float(valor):.2%}",
+        }
         for nome, valor in probabilidades.items()
     ]
     st.dataframe(prob_rows, use_container_width=True, hide_index=True)
-
 
 def carregar_analise_deepglobe(segmenter_key):
     imagens = st.session_state.deepglobe_imagens
@@ -317,7 +343,7 @@ def rotular_deepglobe(classe_destino):
     imagem_original = st.session_state.get("deepglobe_current_original")
     imagem_segmentada = st.session_state.get("deepglobe_current_segmented")
     if imagem_original is None or imagem_segmentada is None:
-        st.error("Gere a segmenta??o antes de rotular este exemplo.")
+        st.error("Gere a segmentação antes de rotular este exemplo.")
         return
 
     caminho = salvar_lado_a_lado(imagem_original, imagem_segmentada, classe_destino)
@@ -344,9 +370,9 @@ def reiniciar_revisao_deepglobe():
 
 
 def render_manual_label_buttons():
-    st.subheader("Rotular qualidade da segmenta??o")
+    st.subheader("Rotular qualidade da segmentação")
     st.caption(
-        "Salva uma imagem lado a lado com a original ? esquerda e o overlay da segmenta??o ? direita."
+        "Salva uma imagem lado a lado com a original à esquerda e o overlay da segmentação à direita."
     )
 
     label_col1, label_col2, label_col3 = st.columns(3)
@@ -359,7 +385,7 @@ def render_manual_label_buttons():
                 imagem_original = st.session_state.get("imagem_original")
                 imagem_segmentada = st.session_state.get("imagem_segmentada")
                 if imagem_original is None or imagem_segmentada is None:
-                    st.error("Gere a segmenta??o antes de rotular este exemplo.")
+                    st.error("Gere a segmentação antes de rotular este exemplo.")
                 else:
                     caminho = salvar_lado_a_lado(
                         imagem_original,
@@ -369,11 +395,10 @@ def render_manual_label_buttons():
                     st.session_state.rotulo_dataset_path = caminho
                     st.success(f"Exemplo salvo em: {caminho}")
 
-
 def render_deepglobe_mode(segmenter_key):
     st.subheader("Modo Coleta com DeepGlobe")
     st.caption(
-        "Usa uma pasta local do DeepGlobe j? baixada, passa no fluxo atual de segmenta??o e permite rotular em lote."
+        "Usa uma pasta local do DeepGlobe já baixada, passa no fluxo atual de segmentação e permite rotular em lote."
     )
 
     dataset_path_input = st.text_input(
@@ -397,15 +422,15 @@ def render_deepglobe_mode(segmenter_key):
                 st.session_state.deepglobe_total = len(imagens)
                 reiniciar_revisao_deepglobe()
                 if imagens:
-                    st.success(f"Dataset local carregado com {len(imagens)} imagens eleg?veis.")
+                    st.success(f"Dataset local carregado com {len(imagens)} imagens elegíveis.")
                 else:
-                    st.warning("Nenhuma imagem RGB eleg?vel foi encontrada nessa pasta.")
+                    st.warning("Nenhuma imagem RGB elegível foi encontrada nessa pasta.")
                 st.rerun()
             except Exception as exc:
                 st.error(f"Falha ao carregar imagens locais: {exc}")
 
     with header2:
-        if st.button("Reiniciar revis?o"):
+        if st.button("Reiniciar revisão"):
             if st.session_state.deepglobe_imagens:
                 reiniciar_revisao_deepglobe()
                 st.rerun()
@@ -428,9 +453,9 @@ def render_deepglobe_mode(segmenter_key):
     count4.metric("Total", total)
 
     if idx >= total:
-        st.success("Revis?o em lote conclu?da para as imagens carregadas.")
+        st.success("Revisão em lote concluída para as imagens carregadas.")
         if st.session_state.deepglobe_last_saved_path:
-            st.info(f"?ltimo exemplo salvo: {st.session_state.deepglobe_last_saved_path}")
+            st.info(f"Último exemplo salvo: {st.session_state.deepglobe_last_saved_path}")
         return
 
     with st.spinner("Processando imagem atual do DeepGlobe..."):
@@ -441,11 +466,11 @@ def render_deepglobe_mode(segmenter_key):
     st.write(f"Imagem {idx + 1} de {total}")
     st.caption(f"Arquivo atual: {current_path}")
     st.caption(
-        f"As imagens do lote s?o redimensionadas para no m?ximo {DEEPGLOBE_MAX_DIM}px antes da segmenta??o para evitar travamentos."
+        f"As imagens do lote são redimensionadas para no máximo {DEEPGLOBE_MAX_DIM}px antes da segmentação para evitar travamentos."
     )
 
     if st.session_state.deepglobe_current_error:
-        st.error(f"Falha na segmenta??o desta imagem: {st.session_state.deepglobe_current_error}")
+        st.error(f"Falha na segmentação desta imagem: {st.session_state.deepglobe_current_error}")
         error_col1, error_col2 = st.columns(2)
         with error_col1:
             if st.button("Pular imagem", key="deepglobe_skip_error"):
@@ -463,22 +488,22 @@ def render_deepglobe_mode(segmenter_key):
     segmented = st.session_state.deepglobe_current_segmented
 
     if analysis is None or original is None or segmented is None:
-        st.warning("A an?lise desta imagem ainda n?o est? pronta.")
+        st.warning("A análise desta imagem ainda não está pronta.")
         return
 
     viz1, viz2 = st.columns(2)
     with viz1:
         st.image(original, caption="Imagem original", use_container_width=True)
     with viz2:
-        st.image(segmented, caption="Segmenta??o autom?tica", use_container_width=True)
+        st.image(segmented, caption="Segmentação automática", use_container_width=True)
 
     validator_result, validator_error = obter_validacao_deepglobe(current_path, original, segmented)
     if validator_result is not None:
-        render_validator_result(validator_result, titulo="Valida??o autom?tica do lote")
+        render_validator_result(validator_result, titulo="Validação automática do lote")
     elif validator_error and validador_disponivel():
-        st.warning(f"N?o foi poss?vel executar o validador autom?tico neste exemplo: {validator_error}")
+        st.warning(f"Não foi possível executar o validador automático neste exemplo: {validator_error}")
     else:
-        st.info("Treine o validador para receber uma recomenda??o autom?tica neste modo.")
+        st.info("Treine o validador para receber uma recomendação automática neste modo.")
 
     action1, action2, action3, action4 = st.columns(4)
     with action1:
@@ -496,12 +521,12 @@ def render_deepglobe_mode(segmenter_key):
             st.rerun()
 
     if st.session_state.deepglobe_last_saved_path:
-        st.info(f"?ltimo exemplo salvo: {st.session_state.deepglobe_last_saved_path}")
+        st.info(f"Último exemplo salvo: {st.session_state.deepglobe_last_saved_path}")
 
 
 def render_manual_upload_mode(segmenter_key):
     uploaded_file = st.file_uploader(
-        "Upload da imagem de sat?lite",
+        "Upload da imagem de satélite",
         type=["png", "jpg", "jpeg", "tif", "tiff"],
     )
 
@@ -527,17 +552,17 @@ def render_manual_upload_mode(segmenter_key):
         st.image(image_np, use_container_width=True)
 
     with col2:
-        st.subheader("Objetivo da demonstra??o")
+        st.subheader("Objetivo da demonstração")
         st.info(PROTOTYPE_DISCLAIMER)
         st.markdown(
             """
-- Segmenta??o autom?tica de regi?es
-- Pr?-classifica??o por classe demonstrativa
-- Regi?es de baixa confian?a destacadas para revis?o humana
+- Segmentação automática de regiões
+- Pré-classificação por classe demonstrativa
+- Regiões de baixa confiança destacadas para revisão humana
 """
         )
         if st.button("Processar imagem"):
-            with st.spinner("Executando segmenta??o e classifica??o..."):
+            with st.spinner("Executando segmentação e classificação..."):
                 st.session_state.analysis = processar_imagem_com_segmentador(
                     image_np,
                     segmenter_key,
@@ -562,15 +587,18 @@ def render_manual_upload_mode(segmenter_key):
     st.divider()
     st.subheader("Resultado do processamento")
 
+    if analysis.get("backend_note"):
+        st.info(analysis["backend_note"]["message"])
+
     if analysis["rsam_note"]:
         st.warning(analysis["rsam_note"]["message"])
 
     meta1, meta2, meta3, meta4 = st.columns(4)
     meta1.metric("Segmentador solicitado", analysis["segmenter_requested"])
     meta2.metric("Segmentador usado", analysis["segmenter_used"])
-    meta3.metric("Regi?es detectadas", len(regions))
+    meta3.metric("Regiões detectadas", len(regions))
     meta4.metric(
-        "Baixa confian?a",
+        "Baixa confiança",
         sum(1 for item in regions if item["needs_review"]),
     )
 
@@ -580,13 +608,13 @@ def render_manual_upload_mode(segmenter_key):
     with viz2:
         st.image(
             analysis["segmentation_overlay"],
-            caption="Segmenta??o autom?tica",
+            caption="Segmentação automática",
             use_container_width=True,
         )
     with viz3:
         st.image(
             analysis["classification_overlay"],
-            caption="Classifica??o colorida por classe",
+            caption="Classificação colorida por classe",
             use_container_width=True,
         )
 
@@ -599,14 +627,14 @@ def render_manual_upload_mode(segmenter_key):
     if validator_result is not None:
         render_validator_result(validator_result)
     elif validator_error and validador_disponivel():
-        st.warning(f"N?o foi poss?vel executar o validador autom?tico: {validator_error}")
+        st.warning(f"Não foi possível executar o validador automático: {validator_error}")
     else:
-        st.info("Treine o validador para receber uma recomenda??o autom?tica da qualidade da segmenta??o.")
+        st.info("Treine o validador para receber uma recomendação automática da qualidade da segmentação.")
 
     render_manual_label_buttons()
 
     if st.session_state.rotulo_dataset_path:
-        st.info(f"?ltimo exemplo salvo: {st.session_state.rotulo_dataset_path}")
+        st.info(f"Último exemplo salvo: {st.session_state.rotulo_dataset_path}")
 
     st.caption(analysis["prototype_message"])
 
@@ -620,24 +648,24 @@ def render_manual_upload_mode(segmenter_key):
 
     low_confidence = [
         {
-            "Regi?o": item["id"],
+            "Região": item["id"],
             "Classe": item["class"],
-            "Confian?a": item["confidence"],
-            "Motivo": item["review_reason"] or "Encaminhar para revis?o humana",
+            "Confiança": item["confidence"],
+            "Motivo": item["review_reason"] or "Encaminhar para revisão humana",
         }
         for item in regions
         if item["needs_review"]
     ]
 
     if low_confidence:
-        st.subheader("Regi?es sugeridas para revis?o humana")
+        st.subheader("Regiões sugeridas para revisão humana")
         st.dataframe(low_confidence, use_container_width=True, hide_index=True)
 
     st.divider()
-    st.subheader("Revis?o regi?o por regi?o")
+    st.subheader("Revisão região por região")
 
     if not regions:
-        st.error("Nenhuma regi?o eleg?vel foi encontrada para revis?o.")
+        st.error("Nenhuma região elegível foi encontrada para revisão.")
         st.stop()
 
     idx = min(st.session_state.current_idx, len(regions) - 1)
@@ -656,19 +684,19 @@ def render_manual_upload_mode(segmenter_key):
     cv2.drawContours(overlay, contours, -1, (255, 255, 255), 2)
     blended = cv2.addWeighted(image_display, 0.58, overlay, 0.42, 0)
 
-    st.image(blended, caption=f"Regi?o {result['id']}", use_container_width=True)
+    st.image(blended, caption=f"Região {result['id']}", use_container_width=True)
 
     info1, info2, info3, info4 = st.columns(4)
     info1.write(f"**Classe:** {result['class']}")
-    info2.write(f"**Confian?a:** {result['confidence']:.0%}")
-    info3.write(f"**?rea (px):** {result['area_pixels']}")
+    info2.write(f"**Confiança:** {result['confidence']:.0%}")
+    info3.write(f"**Área (px):** {result['area_pixels']}")
     info4.write(f"**Status:** {result['status']}")
 
     if result["review_reason"]:
-        st.warning(f"Revis?o recomendada: {result['review_reason']}")
+        st.warning(f"Revisão recomendada: {result['review_reason']}")
 
     st.progress((idx + 1) / len(regions))
-    st.write(f"Regi?o {idx + 1} de {len(regions)}")
+    st.write(f"Região {idx + 1} de {len(regions)}")
 
     nav1, action1, action2, action3, nav2 = st.columns([2, 3, 3, 3, 2])
 
@@ -678,30 +706,30 @@ def render_manual_upload_mode(segmenter_key):
             st.rerun()
 
     with action1:
-        if st.button("Aprovar regi?o", key=f"approve_{idx}"):
+        if st.button("Aprovar região", key=f"approve_{idx}"):
             st.session_state.analysis["regions"][idx]["status"] = "approved"
             st.session_state.current_idx = min(idx + 1, len(regions) - 1)
             st.rerun()
 
     with action2:
-        if st.button("Rejeitar regi?o", key=f"reject_{idx}"):
+        if st.button("Rejeitar região", key=f"reject_{idx}"):
             st.session_state.analysis["regions"][idx]["status"] = "rejected"
             st.session_state.current_idx = min(idx + 1, len(regions) - 1)
             st.rerun()
 
     with action3:
-        if st.button("Revisar regi?o", key=f"adjust_{idx}"):
+        if st.button("Revisar região", key=f"adjust_{idx}"):
             st.session_state.analysis["regions"][idx]["status"] = "needs_adjustment"
             st.session_state.current_idx = min(idx + 1, len(regions) - 1)
             st.rerun()
 
     with nav2:
-        if idx < len(regions) - 1 and st.button("Pr?xima", key=f"next_{idx}"):
+        if idx < len(regions) - 1 and st.button("Próxima", key=f"next_{idx}"):
             st.session_state.current_idx += 1
             st.rerun()
 
     st.divider()
-    st.subheader("Status da revis?o")
+    st.subheader("Status da revisão")
     approved = sum(1 for item in regions if item["status"] == "approved")
     rejected = sum(1 for item in regions if item["status"] == "rejected")
     needs_adjustment = sum(1 for item in regions if item["status"] == "needs_adjustment")
