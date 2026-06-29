@@ -1,0 +1,1 @@
+from .predict_validator import prever_qualidade_segmentacao, prever_qualidade_segmentacao_pil
